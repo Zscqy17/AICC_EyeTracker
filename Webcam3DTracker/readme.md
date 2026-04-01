@@ -17,7 +17,37 @@ https://amzn.to/43of401
 Usage
 -----
 
-Connect a webcam. By default, camera index 0 is used. Change in code if needed.
+Use Python 3.10 to 3.12. The project depends on the MediaPipe Solutions API, so install from requirements.txt and keep `mediapipe==0.10.21`.
+
+One-click launch:
+- macOS / Linux shell: `./run_tracker.sh`
+- Windows batch: `run_tracker.bat`
+- Setup only without starting the camera: `./run_tracker.sh --setup-only` or `run_tracker.bat --setup-only`
+- Choose a different camera index: `./run_tracker.sh 1` or `run_tracker.bat 1`
+
+The launcher will automatically:
+- find Python 3.10 to 3.12
+- recreate `.venv` if it is missing or incompatible
+- install or refresh dependencies when `requirements.txt` changes
+- start `MonitorTracking.py`
+
+Connect a webcam. By default, camera index 0 is used. You can override it with the `CAMERA_INDEX` environment variable.
+
+macOS setup:
+- `python3.12 -m venv .venv`
+- `source .venv/bin/activate`
+- `pip install -r requirements.txt`
+- `python MonitorTracking.py`
+
+Windows setup:
+- `py -3.12 -m venv .venv`
+- `.venv\Scripts\activate`
+- `pip install -r requirements.txt`
+- `python MonitorTracking.py`
+
+On macOS, the script uses the built-in camera by default. If the wrong camera opens, launch with `CAMERA_INDEX=1 python MonitorTracking.py` or another index.
+
+On Windows, if the default camera is wrong, run `set CAMERA_INDEX=1 && python MonitorTracking.py` from Command Prompt or `$env:CAMERA_INDEX=1; python MonitorTracking.py` from PowerShell.
 
 Run the tracker:
 python MonitorTracking.py
@@ -30,7 +60,8 @@ Windows will open showing:
 Interactive controls:
 -----
 - c = calibrate (screen center)
-- F7 = toggle mouse control (disabled by default)
+- m = toggle mouse control (disabled by default)
+- F7 = optional global mouse-control toggle on Windows when `keyboard` is installed
 - j/l = orbit yaw left/right
 - i/k = orbit pitch up/down
 - [ / ] = zoom orbit view out/in
@@ -46,5 +77,8 @@ Markers (x key) allow quick tests of where the system thinks you are looking.
 Troubleshooting
 -----
 - If gaze appears jittery, increase filter_length.
-- If the wrong camera opens, change cv2.VideoCapture(0) to another index.
+- If the wrong camera opens, use the `CAMERA_INDEX` environment variable.
+- On macOS, allow camera access for VS Code or Terminal in System Settings > Privacy & Security > Camera.
+- On macOS, enable Accessibility permissions as well if you want mouse control through PyAutoGUI.
+- If startup fails with a MediaPipe error, recreate the virtual environment and reinstall from requirements.txt so `mediapipe==0.10.21` is used.
 - For better accuracy, use consistent lighting and this webcam: https://amzn.to/43of401.

@@ -2,19 +2,39 @@ import cv2
 import numpy as np
 import os
 import mediapipe as mp
+import sys
 import time
 import math
 from scipy.spatial.transform import Rotation as Rscipy
 from collections import deque
-import pyautogui
 import threading
-import keyboard
+
+try:
+    import pyautogui
+except Exception:
+    pyautogui = None
+
+try:
+    import keyboard
+except Exception:
+    keyboard = None
 
 # Screen and mouse control setup (from old script)
-MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+if pyautogui is not None:
+    try:
+        MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
+    except Exception:
+        pyautogui = None
+        MONITOR_WIDTH, MONITOR_HEIGHT = (1920, 1080)
+else:
+    MONITOR_WIDTH, MONITOR_HEIGHT = (1920, 1080)
 CENTER_X = MONITOR_WIDTH // 2
 CENTER_Y = MONITOR_HEIGHT // 2
 mouse_control_enabled = False
+last_mouse_toggle_time = 0.0
+global_hotkey_warning_shown = False
 filter_length = 10
 gaze_length = 350
 
@@ -60,7 +80,13 @@ R_ref_forehead = [None]
 calibration_nose_scale = None
 
 # Initialize MediaPipe FaceMesh
-mp_face_mesh = mp.solutions.face_mesh
+try:
+    mp_face_mesh = mp.solutions.face_mesh
+except AttributeError as exc:
+    raise RuntimeError(
+        "This project requires the MediaPipe Solutions API. Install the pinned dependency set from requirements.txt, which uses mediapipe==0.10.21."
+    ) from exc
+
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
@@ -69,8 +95,34 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
+def open_camera(camera_index):
+    backend_candidates = []
+    if sys.platform == "darwin":
+        backend_candidates.append(cv2.CAP_AVFOUNDATION)
+    elif sys.platform.startswith("win"):
+        backend_candidates.append(cv2.CAP_DSHOW)
+
+    backend_candidates.append(None)
+
+    for backend in backend_candidates:
+        if backend is None:
+            cap = cv2.VideoCapture(camera_index)
+        else:
+            cap = cv2.VideoCapture(camera_index, backend)
+
+        if cap.isOpened():
+            return cap
+
+        cap.release()
+
+    return cv2.VideoCapture(camera_index)
+
 # === Open webcam ===
-cap = cv2.VideoCapture(0)
+cap = open_camera(CAMERA_INDEX)
+if not cap.isOpened():
+    raise RuntimeError(
+        f"Unable to open camera index {CAMERA_INDEX}. On macOS, allow camera access for VS Code or Terminal in System Settings > Privacy & Security > Camera."
+    )
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -81,10 +133,16 @@ nose_indices = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
                 3, 248]
 
 # ===== NEW: File writing for screen position =====
-screen_position_file = "C:/Storage/Google Drive/Software/EyeTracker3DPython/screen_position.txt"
+screen_position_file = os.environ.get(
+    "SCREEN_POSITION_FILE",
+    os.path.join(PROJECT_DIR, "screen_position.txt")
+)
 
 def write_screen_position(x, y):
     """Write screen position to file, overwriting the same line"""
+    output_dir = os.path.dirname(screen_position_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     with open(screen_position_file, 'w') as f:
         f.write(f"{x},{y}\n")
 
@@ -178,9 +236,41 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
 
 
 
-def update_orbit_from_keys():
-    """Keyboard orbit controls that PRINT every frame while a key is held."""
+def is_hotkey_pressed(key_name):
+    global keyboard, global_hotkey_warning_shown
+    if keyboard is None:
+        return False
+
+    try:
+        return keyboard.is_pressed(key_name)
+    except Exception as exc:
+        if not global_hotkey_warning_shown:
+            print(f"[Input] Global hotkeys unavailable ({exc}). Use the OpenCV window shortcuts instead.")
+            global_hotkey_warning_shown = True
+        keyboard = None
+        return False
+
+def toggle_mouse_control():
+    global mouse_control_enabled, last_mouse_toggle_time
+    if pyautogui is None:
+        print("[Mouse Control] PyAutoGUI unavailable; mouse control disabled on this machine.")
+        return
+
+    now = time.time()
+    if now - last_mouse_toggle_time < 0.3:
+        return
+
+    last_mouse_toggle_time = now
+    mouse_control_enabled = not mouse_control_enabled
+    print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
+
+def update_orbit_from_keypress(key_code):
+    """Keyboard orbit controls using the focused OpenCV window."""
     global orbit_yaw, orbit_pitch, orbit_radius
+    if key_code < 0:
+        return
+
+    key = key_code & 0xFF
     yaw_step   = math.radians(1.5)
     pitch_step = math.radians(1.5)
     zoom_step  = 12.0
@@ -188,23 +278,23 @@ def update_orbit_from_keys():
     changed = False
 
     # Rotate
-    if keyboard.is_pressed('j'):  # yaw left
+    if key in (ord('j'), ord('J')):  # yaw left
         orbit_yaw -= yaw_step; changed = True
-    if keyboard.is_pressed('l'):  # yaw right
+    if key in (ord('l'), ord('L')):  # yaw right
         orbit_yaw += yaw_step; changed = True
-    if keyboard.is_pressed('i'):  # pitch up
+    if key in (ord('i'), ord('I')):  # pitch up
         orbit_pitch += pitch_step; changed = True
-    if keyboard.is_pressed('k'):  # pitch down
+    if key in (ord('k'), ord('K')):  # pitch down
         orbit_pitch -= pitch_step; changed = True
 
     # Zoom
-    if keyboard.is_pressed('['):  # zoom out
+    if key == ord('['):  # zoom out
         orbit_radius += zoom_step; changed = True
-    if keyboard.is_pressed(']'):  # zoom in
+    if key == ord(']'):  # zoom in
         orbit_radius = max(80.0, orbit_radius - zoom_step); changed = True
 
     # Reset (prints every frame while held)
-    if keyboard.is_pressed('r'):
+    if key in (ord('r'), ord('R')):
         orbit_yaw = 0.0
         orbit_pitch = 0.0
         orbit_radius = 600.0
@@ -676,7 +766,7 @@ def render_debug_view_orbit(
         "R = reset view",
         "X = add marker",
         "q = quit",
-        "F7 = toggle mouse control"
+        "M = toggle mouse control"
     ]
 
     font        = cv2.FONT_HERSHEY_SIMPLEX
@@ -700,7 +790,7 @@ def render_debug_view_orbit(
 def mouse_mover():
     """Mouse movement thread from old script"""
     while True:
-        if mouse_control_enabled:
+        if mouse_control_enabled and pyautogui is not None:
             with mouse_lock:
                 x, y = mouse_target
             pyautogui.moveTo(x, y)
@@ -857,9 +947,6 @@ while cap.isOpened():
             x, y = int(lm.x * w), int(lm.y * h)
             cv2.circle(frame, (x, y), 0, (255, 255, 255), -1)
 
-        # Smooth orbit controls each frame
-        update_orbit_from_keys()
-
         # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
         landmarks3d = None
         if results.multi_face_landmarks:
@@ -890,15 +977,18 @@ while cap.isOpened():
     cv2.imshow("Integrated Eye Tracking", frame)
 
     # Handle keyboard input
-    if keyboard.is_pressed('f7'):
-        mouse_control_enabled = not mouse_control_enabled
-        print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
-        time.sleep(0.3)  # debounce to prevent rapid toggling
+    if is_hotkey_pressed('f7'):
+        toggle_mouse_control()
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
+    key = cv2.waitKeyEx(1)
+    update_orbit_from_keypress(key)
+    key_char = key & 0xFF if key != -1 else -1
+
+    if key_char in (ord('m'), ord('M')):
+        toggle_mouse_control()
+    elif key_char in (ord('q'), ord('Q')):
         break
-    elif key == ord('c') and not (left_sphere_locked and right_sphere_locked):
+    elif key_char in (ord('c'), ord('C')) and not (left_sphere_locked and right_sphere_locked):
         current_nose_scale = compute_scale(nose_points_3d)
         # Lock LEFT eye
         left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
@@ -951,7 +1041,7 @@ while cap.isOpened():
 
 
         print("[Both Spheres Locked] Eye sphere calibration complete.")
-    elif key == ord('s') and left_sphere_locked and right_sphere_locked:
+    elif key_char in (ord('s'), ord('S')) and left_sphere_locked and right_sphere_locked:
         # Screen calibration - user should look at center of screen when pressing 's'
         # Get current gaze direction
         left_gaze_dir = iris_3d_left - sphere_world_l
@@ -971,7 +1061,7 @@ while cap.isOpened():
         calibration_offset_pitch = 0 - raw_pitch
         
         print(f"[Screen Calibrated] Offset Yaw: {calibration_offset_yaw:.2f}, Offset Pitch: {calibration_offset_pitch:.2f}")
-    elif key == ord('x'):
+    elif key_char in (ord('x'), ord('X')):
         # Drop a marker at the current gaze∩monitor point
         if (monitor_corners is not None and monitor_center_w is not None and monitor_normal_w is not None
             and left_sphere_locked and right_sphere_locked):
