@@ -22,6 +22,10 @@ except Exception:
 # Screen and mouse control setup (from old script)
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+REGRESSION_CALIBRATION_FILE = os.environ.get(
+    "REGRESSION_CALIBRATION_FILE",
+    os.path.join(PROJECT_DIR, "monitor_tracking_regression.npz"),
+)
 if pyautogui is not None:
     try:
         MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -37,6 +41,11 @@ last_mouse_toggle_time = 0.0
 global_hotkey_warning_shown = False
 filter_length = 10
 gaze_length = 350
+SCREEN_YAW_DEGREES = 15.0
+SCREEN_PITCH_DEGREES = 5.0
+CALIBRATION_WINDOW_NAME = "9-Point Calibration"
+NINE_POINT_CAPTURE_FRAMES = 18
+NINE_POINT_MAX_STD_DEG = 0.75
 
 # --- Orbit camera state for the debug view ---
 orbit_yaw   = -151.0          # radians, left/right
@@ -72,6 +81,19 @@ calib_step = 0
 
 # Buffers to store recent gaze data for smoothing
 combined_gaze_directions = deque(maxlen=filter_length)
+recent_gaze_angles = deque(maxlen=NINE_POINT_CAPTURE_FRAMES)
+
+# --- Interactive 9-point regression calibration state ---
+nine_point_active = False
+nine_point_targets = []
+nine_point_samples = []
+nine_point_index = 0
+regression_coefficients_x = None
+regression_coefficients_y = None
+regression_fit_error_px = None
+calibration_window_ready = False
+nine_point_status_text = ""
+regression_loaded_from_disk = False
 
 # reference matrices to fix coordinate flipping issue
 # These help keep the axes consistent from frame to frame by stabilizing eigenvector directions
@@ -166,6 +188,308 @@ def _normalize(v):
 def _focal_px(width, fov_deg):
     # horizontal pinhole focal length
     return 0.5 * width / math.tan(math.radians(fov_deg) * 0.5)
+
+
+def quadratic_features(raw_yaw_deg, raw_pitch_deg):
+    return np.array(
+        [
+            1.0,
+            raw_yaw_deg,
+            raw_pitch_deg,
+            raw_yaw_deg * raw_pitch_deg,
+            raw_yaw_deg * raw_yaw_deg,
+            raw_pitch_deg * raw_pitch_deg,
+        ],
+        dtype=float,
+    )
+
+
+def regression_ready():
+    return regression_coefficients_x is not None and regression_coefficients_y is not None
+
+
+def clear_regression_calibration():
+    global regression_coefficients_x, regression_coefficients_y, regression_fit_error_px
+    global regression_loaded_from_disk
+
+    regression_coefficients_x = None
+    regression_coefficients_y = None
+    regression_fit_error_px = None
+    regression_loaded_from_disk = False
+
+
+def save_regression_calibration():
+    if not regression_ready():
+        return False
+
+    output_dir = os.path.dirname(REGRESSION_CALIBRATION_FILE)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    np.savez(
+        REGRESSION_CALIBRATION_FILE,
+        format_version=np.array([1], dtype=np.int32),
+        regression_coefficients_x=np.asarray(regression_coefficients_x, dtype=float),
+        regression_coefficients_y=np.asarray(regression_coefficients_y, dtype=float),
+        regression_fit_error_px=np.array(
+            [np.nan if regression_fit_error_px is None else regression_fit_error_px],
+            dtype=float,
+        ),
+        screen_width=np.array([MONITOR_WIDTH], dtype=np.int32),
+        screen_height=np.array([MONITOR_HEIGHT], dtype=np.int32),
+        saved_at=np.array([time.time()], dtype=float),
+    )
+    print(f"[9-Point Calibration] Saved regression to {REGRESSION_CALIBRATION_FILE}")
+    return True
+
+
+def load_regression_calibration(announce=True):
+    global regression_coefficients_x, regression_coefficients_y, regression_fit_error_px
+    global regression_loaded_from_disk, nine_point_status_text
+
+    if not os.path.exists(REGRESSION_CALIBRATION_FILE):
+        return False
+
+    try:
+        calibration_data = np.load(REGRESSION_CALIBRATION_FILE, allow_pickle=False)
+        coefficient_x = np.asarray(calibration_data["regression_coefficients_x"], dtype=float).reshape(-1)
+        coefficient_y = np.asarray(calibration_data["regression_coefficients_y"], dtype=float).reshape(-1)
+        if coefficient_x.shape != (6,) or coefficient_y.shape != (6,):
+            raise ValueError("Expected 6 regression coefficients for both axes.")
+
+        fit_error = calibration_data.get("regression_fit_error_px")
+        if fit_error is None:
+            regression_fit_error_px = None
+        else:
+            fit_error_value = float(np.asarray(fit_error, dtype=float).reshape(-1)[0])
+            regression_fit_error_px = None if math.isnan(fit_error_value) else fit_error_value
+
+        regression_coefficients_x = coefficient_x
+        regression_coefficients_y = coefficient_y
+        regression_loaded_from_disk = True
+        if regression_fit_error_px is not None:
+            nine_point_status_text = f"Loaded saved 9-point regression ({regression_fit_error_px:.1f}px RMSE)."
+        else:
+            nine_point_status_text = "Loaded saved 9-point regression."
+
+        if announce:
+            print(f"[9-Point Calibration] Loaded regression from {REGRESSION_CALIBRATION_FILE}")
+        return True
+    except Exception as exc:
+        clear_regression_calibration()
+        print(f"[9-Point Calibration] Failed to load saved regression: {exc}")
+        return False
+
+
+def default_nine_point_targets(margin_ratio=0.1):
+    if not 0.0 <= margin_ratio < 0.5:
+        raise ValueError("margin_ratio must be between 0.0 and 0.5.")
+
+    width_scale = max(MONITOR_WIDTH - 1, 1)
+    height_scale = max(MONITOR_HEIGHT - 1, 1)
+    x_positions = [margin_ratio, 0.5, 1.0 - margin_ratio]
+    y_positions = [margin_ratio, 0.5, 1.0 - margin_ratio]
+
+    return [
+        (int(round(x_ratio * width_scale)), int(round(y_ratio * height_scale)))
+        for y_ratio in y_positions
+        for x_ratio in x_positions
+    ]
+
+
+def close_nine_point_window():
+    global calibration_window_ready
+
+    if not calibration_window_ready:
+        return
+
+    try:
+        cv2.destroyWindow(CALIBRATION_WINDOW_NAME)
+    except cv2.error:
+        pass
+
+    calibration_window_ready = False
+
+
+def reset_nine_point_calibration(clear_regression=False):
+    global nine_point_active, nine_point_targets, nine_point_samples, nine_point_index
+    global nine_point_status_text
+
+    nine_point_active = False
+    nine_point_targets = []
+    nine_point_samples = []
+    nine_point_index = 0
+    nine_point_status_text = ""
+    recent_gaze_angles.clear()
+    close_nine_point_window()
+
+    if clear_regression:
+        clear_regression_calibration()
+
+
+def start_nine_point_calibration():
+    global nine_point_active, nine_point_targets, nine_point_samples, nine_point_index
+    global nine_point_status_text
+
+    reset_nine_point_calibration(clear_regression=False)
+    nine_point_active = True
+    nine_point_targets = default_nine_point_targets()
+    nine_point_samples = []
+    nine_point_index = 0
+    nine_point_status_text = "Target 1/9: move your gaze and hold steady."
+    print("[9-Point Calibration] Started. Follow the fullscreen targets.")
+
+
+def fit_nine_point_regression():
+    global regression_coefficients_x, regression_coefficients_y, regression_fit_error_px
+    global regression_loaded_from_disk
+    global nine_point_status_text
+
+    target_count = len(nine_point_targets)
+    if target_count == 0 or len(nine_point_samples) < target_count:
+        return False
+
+    width_scale = max(MONITOR_WIDTH - 1, 1)
+    height_scale = max(MONITOR_HEIGHT - 1, 1)
+    design_rows = []
+    target_x_values = []
+    target_y_values = []
+
+    for target_point, raw_yaw_deg, raw_pitch_deg in nine_point_samples:
+        design_rows.append(quadratic_features(raw_yaw_deg, raw_pitch_deg))
+        target_x_values.append(target_point[0] / width_scale)
+        target_y_values.append(target_point[1] / height_scale)
+
+    design_matrix = np.vstack(design_rows)
+    target_x = np.asarray(target_x_values, dtype=float)
+    target_y = np.asarray(target_y_values, dtype=float)
+
+    regression_coefficients_x = np.linalg.lstsq(design_matrix, target_x, rcond=None)[0]
+    regression_coefficients_y = np.linalg.lstsq(design_matrix, target_y, rcond=None)[0]
+    regression_loaded_from_disk = False
+
+    predicted_x = design_matrix @ regression_coefficients_x
+    predicted_y = design_matrix @ regression_coefficients_y
+    error_x_px = (predicted_x - target_x) * width_scale
+    error_y_px = (predicted_y - target_y) * height_scale
+    regression_fit_error_px = float(np.sqrt(np.mean(error_x_px * error_x_px + error_y_px * error_y_px)))
+    nine_point_status_text = f"9-point regression ready ({regression_fit_error_px:.1f}px RMSE)."
+    save_regression_calibration()
+    return True
+
+
+def capture_nine_point_sample():
+    global nine_point_active, nine_point_index, nine_point_status_text
+
+    target_count = len(nine_point_targets)
+    if not nine_point_active or target_count == 0 or nine_point_index >= target_count:
+        return False
+
+    sample_count = len(recent_gaze_angles)
+    target_number = min(nine_point_index + 1, target_count)
+    if sample_count < NINE_POINT_CAPTURE_FRAMES:
+        nine_point_status_text = (
+            f"Target {target_number}/{target_count}: hold steady "
+            f"{sample_count}/{NINE_POINT_CAPTURE_FRAMES}."
+        )
+        return False
+
+    sample_array = np.asarray(recent_gaze_angles, dtype=float)
+    yaw_std = float(np.std(sample_array[:, 0]))
+    pitch_std = float(np.std(sample_array[:, 1]))
+    if yaw_std > NINE_POINT_MAX_STD_DEG or pitch_std > NINE_POINT_MAX_STD_DEG:
+        nine_point_status_text = (
+            f"Target {target_number}/{target_count}: keep steadier before capture."
+        )
+        return False
+
+    median_yaw_deg, median_pitch_deg = np.median(sample_array, axis=0)
+    target_point = nine_point_targets[nine_point_index]
+    nine_point_samples.append((target_point, float(median_yaw_deg), float(median_pitch_deg)))
+    print(
+        f"[9-Point Calibration] Captured target {target_number}/{target_count} "
+        f"at ({target_point[0]}, {target_point[1]})."
+    )
+
+    nine_point_index += 1
+    recent_gaze_angles.clear()
+
+    if nine_point_index >= target_count:
+        nine_point_active = False
+        close_nine_point_window()
+        fit_success = fit_nine_point_regression()
+        if fit_success:
+            print(f"[9-Point Calibration] Regression fitted. RMSE={regression_fit_error_px:.2f}px")
+        else:
+            nine_point_status_text = "9-point regression fit failed."
+            print("[9-Point Calibration] Regression fit failed.")
+        return fit_success
+
+    nine_point_status_text = f"Target {nine_point_index + 1}/{target_count}: move your gaze and hold steady."
+    return True
+
+
+def draw_nine_point_calibration_window():
+    global calibration_window_ready
+
+    if not nine_point_active:
+        return
+
+    if not calibration_window_ready:
+        cv2.namedWindow(CALIBRATION_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        try:
+            cv2.setWindowProperty(CALIBRATION_WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except cv2.error:
+            pass
+        calibration_window_ready = True
+
+    canvas = np.zeros((MONITOR_HEIGHT, MONITOR_WIDTH, 3), dtype=np.uint8)
+    canvas[:] = (18, 18, 18)
+
+    target_count = len(nine_point_targets)
+    current_target = min(nine_point_index + 1, target_count) if target_count else 0
+    for index, (target_x, target_y) in enumerate(nine_point_targets):
+        point = (int(target_x), int(target_y))
+        if index < len(nine_point_samples):
+            cv2.circle(canvas, point, 18, (40, 180, 40), -1, lineType=cv2.LINE_AA)
+        elif index == nine_point_index:
+            cv2.circle(canvas, point, 26, (0, 80, 255), 2, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (point[0] - 34, point[1]), (point[0] + 34, point[1]), (0, 80, 255), 2)
+            cv2.line(canvas, (point[0], point[1] - 34), (point[0], point[1] + 34), (0, 80, 255), 2)
+        else:
+            cv2.circle(canvas, point, 14, (90, 90, 90), 2, lineType=cv2.LINE_AA)
+
+    header = f"9-Point Calibration {current_target}/{target_count}" if target_count else "9-Point Calibration"
+    progress = min(len(recent_gaze_angles), NINE_POINT_CAPTURE_FRAMES)
+    status_line = nine_point_status_text or "Follow the current target."
+
+    cv2.putText(canvas, header, (48, 64), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (240, 240, 240), 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        f"Stable frames: {progress}/{NINE_POINT_CAPTURE_FRAMES}",
+        (48, 104),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (200, 200, 200),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(canvas, status_line, (48, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        "Press ESC to cancel this calibration run.",
+        (48, MONITOR_HEIGHT - 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (180, 180, 180),
+        2,
+        cv2.LINE_AA,
+    )
+
+    cv2.imshow(CALIBRATION_WINDOW_NAME, canvas)
+
+
+load_regression_calibration(announce=True)
 
 
 def create_monitor_plane(head_center, R_final, face_landmarks, w, h, 
@@ -450,64 +774,57 @@ def compute_and_draw_coordinate_box(frame, face_landmarks, indices, ref_matrix_c
 
     return center, R_final, points_3d
 
+
+def raw_gaze_angles(combined_gaze_direction):
+    reference_forward = np.array([0.0, 0.0, -1.0], dtype=float)
+    avg_direction = combined_gaze_direction / np.linalg.norm(combined_gaze_direction)
+
+    xz_proj = np.array([avg_direction[0], 0.0, avg_direction[2]], dtype=float)
+    xz_proj /= np.linalg.norm(xz_proj)
+    yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
+    if avg_direction[0] < 0:
+        yaw_rad = -yaw_rad
+
+    yz_proj = np.array([0.0, avg_direction[1], avg_direction[2]], dtype=float)
+    yz_proj /= np.linalg.norm(yz_proj)
+    pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
+    if avg_direction[1] > 0:
+        pitch_rad = -pitch_rad
+
+    yaw_deg = np.degrees(yaw_rad)
+    pitch_deg = np.degrees(pitch_rad)
+
+    if yaw_deg < 0:
+        yaw_deg = -yaw_deg
+    elif yaw_deg > 0:
+        yaw_deg = -yaw_deg
+
+    return float(yaw_deg), float(pitch_deg)
+
+
+def linear_screen_coordinates(raw_yaw_deg, raw_pitch_deg, offset_yaw, offset_pitch):
+    yaw_deg = raw_yaw_deg + offset_yaw
+    pitch_deg = raw_pitch_deg + offset_pitch
+
+    screen_x = int(((yaw_deg + SCREEN_YAW_DEGREES) / (2 * SCREEN_YAW_DEGREES)) * MONITOR_WIDTH)
+    screen_y = int(((SCREEN_PITCH_DEGREES - pitch_deg) / (2 * SCREEN_PITCH_DEGREES)) * MONITOR_HEIGHT)
+
+    screen_x = max(10, min(screen_x, MONITOR_WIDTH - 10))
+    screen_y = max(10, min(screen_y, MONITOR_HEIGHT - 10))
+    return screen_x, screen_y
+
 def convert_gaze_to_screen_coordinates(combined_gaze_direction, calibration_offset_yaw, calibration_offset_pitch):
     """
     Convert 3D gaze direction vector to 2D screen coordinates
     This function is adapted from the old script's vector-to-screen mapping logic
     """
-    # Reference forward direction (camera looking straight ahead)
-    reference_forward = np.array([0, 0, -1])  # Z-axis into the screen
-
-    # Normalize the gaze direction
-    avg_direction = combined_gaze_direction / np.linalg.norm(combined_gaze_direction)
-
-    # Horizontal (yaw) angle from reference (project onto XZ plane)
-    xz_proj = np.array([avg_direction[0], 0, avg_direction[2]])
-    xz_proj /= np.linalg.norm(xz_proj)
-    yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
-    if avg_direction[0] < 0:
-        yaw_rad = -yaw_rad  # left is negative
-
-    # Vertical (pitch) angle from reference (project onto YZ plane)
-    yz_proj = np.array([0, avg_direction[1], avg_direction[2]])
-    yz_proj /= np.linalg.norm(yz_proj)
-    pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
-    if avg_direction[1] > 0:
-        pitch_rad = -pitch_rad  # up is positive
-
-    # Convert to degrees and re-center around 0
-    yaw_deg = np.degrees(yaw_rad)
-    pitch_deg = np.degrees(pitch_rad)
-
-    # Convert left rotations to 0-180 (from old script logic)
-    if yaw_deg < 0:
-        yaw_deg = -(yaw_deg)
-    elif yaw_deg > 0:
-        yaw_deg = - yaw_deg
-
-    #yaw is now converted to -90 (looking directly left) to +90 (looking directly right), wrt camera
-    #pitch is now converted to +90 (looking straight up) and -90 (looking straight down), wrt camera
-    
-    raw_yaw_deg = yaw_deg
-    raw_pitch_deg = pitch_deg
-
-    
-    # Specify degrees at which screen border will be reached
-    yawDegrees = 5 * 3  # x degrees left or right
-    pitchDegrees = 2.0 * 2.5  # x degrees up or down
-
-    # Apply calibration offsets
-    yaw_deg += calibration_offset_yaw
-    pitch_deg += calibration_offset_pitch
-
-    # Map to full screen resolution
-    screen_x = int(((yaw_deg + yawDegrees) / (2 * yawDegrees)) * MONITOR_WIDTH)
-    screen_y = int(((pitchDegrees - pitch_deg) / (2 * pitchDegrees)) * MONITOR_HEIGHT)
-
-    # Clamp screen position to monitor bounds
-    screen_x = max(10, min(screen_x, MONITOR_WIDTH - 10))
-    screen_y = max(10, min(screen_y, MONITOR_HEIGHT - 10))
-
+    raw_yaw_deg, raw_pitch_deg = raw_gaze_angles(combined_gaze_direction)
+    screen_x, screen_y = linear_screen_coordinates(
+        raw_yaw_deg,
+        raw_pitch_deg,
+        calibration_offset_yaw,
+        calibration_offset_pitch,
+    )
     return screen_x, screen_y, raw_yaw_deg, raw_pitch_deg
 
 def render_debug_view_orbit(
@@ -754,9 +1071,39 @@ def render_debug_view_orbit(
                                 cv2.circle(debug, center_px, r_px, (0, 255, 255), 2, lineType=cv2.LINE_AA)
 
 
+    status_lines = []
+    if nine_point_active and nine_point_targets:
+        target_number = min(nine_point_index + 1, len(nine_point_targets))
+        status_lines.append(f"9-point target {target_number}/{len(nine_point_targets)}")
+        status_lines.append(f"Stable frames {min(len(recent_gaze_angles), NINE_POINT_CAPTURE_FRAMES)}/{NINE_POINT_CAPTURE_FRAMES}")
+    elif regression_ready() and regression_fit_error_px is not None:
+        status_lines.append(f"9-point regression ready ({regression_fit_error_px:.1f}px RMSE)")
+    elif calibration_offset_yaw != 0 or calibration_offset_pitch != 0:
+        status_lines.append("Center calibration ready")
+    else:
+        status_lines.append("Linear mapping only")
+
+    if nine_point_status_text:
+        status_lines.append(nine_point_status_text)
+
+    for index, text in enumerate(status_lines[:3]):
+        cv2.putText(
+            debug,
+            text,
+            (10, 24 + index * 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
     # --- Key command help text in lower-left ---
     help_text = [
-        "C = calibrate screen center",
+        "C = lock eye spheres",
+        "S = calibrate screen center",
+        "9 = start 9-point calibration",
+        "ESC = cancel 9-point run",
         "J = yaw left",
         "L = yaw right",
         "I = pitch up",
@@ -814,6 +1161,22 @@ while cap.isOpened():
         break
 
     combined_dir = None  # will be filled once you compute a smoothed direction
+    face_landmarks = None
+    head_center = None
+    R_final = None
+    nose_points_3d = None
+    iris_3d_left = None
+    iris_3d_right = None
+    sphere_world_l = None
+    sphere_world_r = None
+    scaled_radius_l = None
+    scaled_radius_r = None
+    avg_combined_direction = None
+    raw_yaw = None
+    raw_pitch = None
+    screen_x = None
+    screen_y = None
+    landmarks3d = None
 
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(frame_rgb)
@@ -898,11 +1261,20 @@ while cap.isOpened():
             combined_dir = avg_combined_direction
 
             # ==== CONVERT GAZE TO SCREEN COORDINATES ====
-            screen_x, screen_y, raw_yaw, raw_pitch = convert_gaze_to_screen_coordinates(
+            linear_screen_x, linear_screen_y, raw_yaw, raw_pitch = convert_gaze_to_screen_coordinates(
                 avg_combined_direction, 
                 calibration_offset_yaw, 
                 calibration_offset_pitch
             )
+
+            if nine_point_active and nine_point_targets:
+                recent_gaze_angles.append((raw_yaw, raw_pitch))
+                capture_nine_point_sample()
+
+            if regression_ready():
+                screen_x, screen_y = regression_screen_coordinates(raw_yaw, raw_pitch)
+            else:
+                screen_x, screen_y = linear_screen_x, linear_screen_y
 
             # Update mouse target
             if mouse_control_enabled:
@@ -924,10 +1296,25 @@ while cap.isOpened():
             )
 
             # Center multiple lines of text
+            mapping_text = "Mapping: 9-point regression"
+            if regression_ready() and regression_loaded_from_disk:
+                mapping_text = "Mapping: saved 9-point regression"
+            elif not regression_ready():
+                mapping_text = "Mapping: linear calibration"
+
             texts = [
                 f"Screen: ({screen_x}, {screen_y})",
-                #f"Mouse: {'ON' if mouse_control_enabled else 'OFF'}"
+                mapping_text,
             ]
+
+            if nine_point_active and nine_point_targets:
+                target_number = min(nine_point_index + 1, len(nine_point_targets))
+                texts.append(
+                    f"9-point: target {target_number}/{len(nine_point_targets)} "
+                    f"| {min(len(recent_gaze_angles), NINE_POINT_CAPTURE_FRAMES)}/{NINE_POINT_CAPTURE_FRAMES} stable frames"
+                )
+            elif regression_ready() and regression_fit_error_px is not None:
+                texts.append(f"9-point RMSE: {regression_fit_error_px:.1f}px")
 
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.7
@@ -937,10 +1324,14 @@ while cap.isOpened():
             for i, text in enumerate(texts):
                 (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
                 center_x = (w - text_width) // 2
-                #center_y = (h // 2) + (i - len(texts)//2) * line_spacing
-                
-                color = (0, 255, 0) if "Mouse: ON" not in text else (0, 255, 0) if mouse_control_enabled else (0, 0, 255)
-                cv2.putText(frame, text, (center_x, 30), font, font_scale, color, thickness)
+                line_y = 30 + i * line_spacing
+                if text.startswith("Screen:"):
+                    color = (0, 255, 0)
+                elif text.startswith("Mapping:"):
+                    color = (255, 220, 0)
+                else:
+                    color = (0, 220, 255)
+                cv2.putText(frame, text, (center_x, line_y), font, font_scale, color, thickness)
 
         # Draw all landmark points in white
         for idx, lm in enumerate(face_landmarks):
@@ -948,31 +1339,37 @@ while cap.isOpened():
             cv2.circle(frame, (x, y), 0, (255, 255, 255), -1)
 
         # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
-        landmarks3d = None
-        if results.multi_face_landmarks:
-            lm = results.multi_face_landmarks[0].landmark
-            landmarks3d = np.array([[p.x * w, p.y * h, p.z * w] for p in lm], dtype=float)
+        lm = results.multi_face_landmarks[0].landmark
+        landmarks3d = np.array([[p.x * w, p.y * h, p.z * w] for p in lm], dtype=float)
 
         render_debug_view_orbit(
             h, w,
-            head_center3d=head_center if 'head_center' in locals() else None,
-            sphere_world_l=sphere_world_l if left_sphere_locked and 'sphere_world_l' in locals() else None,
-            scaled_radius_l=scaled_radius_l if left_sphere_locked and 'scaled_radius_l' in locals() else None,
-            sphere_world_r=sphere_world_r if right_sphere_locked and 'sphere_world_r' in locals() else None,
-            scaled_radius_r=scaled_radius_r if right_sphere_locked and 'scaled_radius_r' in locals() else None,
-            iris3d_l=iris_3d_left if 'iris_3d_left' in locals() else None,
-            iris3d_r=iris_3d_right if 'iris_3d_right' in locals() else None,
+            head_center3d=head_center,
+            sphere_world_l=sphere_world_l if left_sphere_locked else None,
+            scaled_radius_l=scaled_radius_l if left_sphere_locked else None,
+            sphere_world_r=sphere_world_r if right_sphere_locked else None,
+            scaled_radius_r=scaled_radius_r if right_sphere_locked else None,
+            iris3d_l=iris_3d_left,
+            iris3d_r=iris_3d_right,
             left_locked=left_sphere_locked,
             right_locked=right_sphere_locked,
             landmarks3d=landmarks3d,
-            combined_dir=avg_combined_direction if 'avg_combined_direction' in locals() else None,
+            combined_dir=avg_combined_direction,
             gaze_len=5230,
             monitor_corners=monitor_corners,
             monitor_center=monitor_center_w,
             monitor_normal=monitor_normal_w,
             gaze_markers=gaze_markers
         )
+    elif nine_point_active and nine_point_targets:
+        recent_gaze_angles.clear()
+        target_number = min(nine_point_index + 1, len(nine_point_targets))
+        nine_point_status_text = f"Target {target_number}/{len(nine_point_targets)}: face lost, look back at the target."
 
+    if nine_point_active:
+        draw_nine_point_calibration_window()
+    elif calibration_window_ready:
+        close_nine_point_window()
 
     cv2.imshow("Integrated Eye Tracking", frame)
 
@@ -984,11 +1381,19 @@ while cap.isOpened():
     update_orbit_from_keypress(key)
     key_char = key & 0xFF if key != -1 else -1
 
-    if key_char in (ord('m'), ord('M')):
+    if key_char == 27 and nine_point_active:
+        reset_nine_point_calibration(clear_regression=False)
+        print("[9-Point Calibration] Cancelled.")
+    elif key_char in (ord('m'), ord('M')):
         toggle_mouse_control()
     elif key_char in (ord('q'), ord('Q')):
         break
-    elif key_char in (ord('c'), ord('C')) and not (left_sphere_locked and right_sphere_locked):
+    elif key_char in (ord('9'),):
+        if not (left_sphere_locked and right_sphere_locked):
+            print("[9-Point Calibration] Lock both eye spheres with 'c' before starting 9-point calibration.")
+        else:
+            start_nine_point_calibration()
+    elif key_char in (ord('c'), ord('C')) and face_landmarks is not None and not (left_sphere_locked and right_sphere_locked):
         current_nose_scale = compute_scale(nose_points_3d)
         # Lock LEFT eye
         left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
@@ -1035,13 +1440,16 @@ while cap.isOpened():
         #global debug_world_frozen, orbit_pivot_frozen
         debug_world_frozen = True
         orbit_pivot_frozen = monitor_center_w.copy()
+        combined_gaze_directions.clear()
+        reset_nine_point_calibration(clear_regression=True)
+        load_regression_calibration(announce=True)
         print("[Debug View] World pivot frozen at monitor center.")
 
         print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
 
 
         print("[Both Spheres Locked] Eye sphere calibration complete.")
-    elif key_char in (ord('s'), ord('S')) and left_sphere_locked and right_sphere_locked:
+    elif key_char in (ord('s'), ord('S')) and left_sphere_locked and right_sphere_locked and avg_combined_direction is not None:
         # Screen calibration - user should look at center of screen when pressing 's'
         # Get current gaze direction
         left_gaze_dir = iris_3d_left - sphere_world_l
@@ -1061,7 +1469,7 @@ while cap.isOpened():
         calibration_offset_pitch = 0 - raw_pitch
         
         print(f"[Screen Calibrated] Offset Yaw: {calibration_offset_yaw:.2f}, Offset Pitch: {calibration_offset_pitch:.2f}")
-    elif key_char in (ord('x'), ord('X')):
+    elif key_char in (ord('x'), ord('X')) and nose_points_3d is not None and head_center is not None and R_final is not None:
         # Drop a marker at the current gaze∩monitor point
         if (monitor_corners is not None and monitor_center_w is not None and monitor_normal_w is not None
             and left_sphere_locked and right_sphere_locked):
@@ -1122,4 +1530,5 @@ while cap.isOpened():
 
 cap.release()
 
+close_nine_point_window()
 cv2.destroyAllWindows()

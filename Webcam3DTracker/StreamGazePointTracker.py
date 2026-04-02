@@ -31,6 +31,10 @@ class GazeTrackingResult:
     gaze_vector: Optional[np.ndarray]
     frame_size: tuple[int, int]
     message: str
+    regression_calibrated: bool = False
+    calibration_samples: int = 0
+    calibration_targets: int = 0
+    regression_fit_error_px: Optional[float] = None
 
 
 def _normalize(vector: np.ndarray) -> np.ndarray:
@@ -49,12 +53,27 @@ def _compute_scale(points_3d: np.ndarray) -> float:
     return total_distance / pair_count if pair_count > 0 else 1.0
 
 
+def _quadratic_features(raw_yaw_deg: float, raw_pitch_deg: float) -> np.ndarray:
+    return np.array(
+        [
+            1.0,
+            raw_yaw_deg,
+            raw_pitch_deg,
+            raw_yaw_deg * raw_pitch_deg,
+            raw_yaw_deg * raw_yaw_deg,
+            raw_pitch_deg * raw_pitch_deg,
+        ],
+        dtype=float,
+    )
+
+
 class StreamGazePointTracker:
     """Track gaze points from grayscale video frames.
 
     The tracker expects a single-channel frame stream, typically 1280x720 at high frame rate.
     It does not open cameras or windows. The caller pushes frames via process_frame and receives
-    the current gaze point after eye calibration and center calibration are completed.
+    the current gaze point after eye calibration and either linear center calibration or
+    9-point regression calibration are completed.
     """
 
     def __init__(
@@ -104,6 +123,10 @@ class StreamGazePointTracker:
         self.calibration_offset_yaw = 0.0
         self.calibration_offset_pitch = 0.0
         self.center_calibrated = False
+        self.regression_samples: dict[tuple[int, int], list[tuple[float, float]]] = {}
+        self.regression_coefficients_x: Optional[np.ndarray] = None
+        self.regression_coefficients_y: Optional[np.ndarray] = None
+        self.regression_fit_error_px: Optional[float] = None
 
     def close(self) -> None:
         self.face_mesh.close()
@@ -120,6 +143,108 @@ class StreamGazePointTracker:
         self.calibration_offset_yaw = 0.0
         self.calibration_offset_pitch = 0.0
         self.center_calibrated = False
+        self.reset_regression_calibration()
+
+    @property
+    def regression_calibrated(self) -> bool:
+        return self.regression_coefficients_x is not None and self.regression_coefficients_y is not None
+
+    @property
+    def regression_sample_count(self) -> int:
+        return sum(len(sample_list) for sample_list in self.regression_samples.values())
+
+    @property
+    def regression_target_count(self) -> int:
+        return len(self.regression_samples)
+
+    def reset_regression_calibration(self) -> None:
+        self.regression_samples = {}
+        self.regression_coefficients_x = None
+        self.regression_coefficients_y = None
+        self.regression_fit_error_px = None
+
+    def default_nine_point_targets(self, margin_ratio: float = 0.1) -> list[tuple[int, int]]:
+        if not 0.0 <= margin_ratio < 0.5:
+            raise ValueError("margin_ratio must be between 0.0 and 0.5.")
+
+        width_scale = max(self.screen_width - 1, 1)
+        height_scale = max(self.screen_height - 1, 1)
+        x_positions = [margin_ratio, 0.5, 1.0 - margin_ratio]
+        y_positions = [margin_ratio, 0.5, 1.0 - margin_ratio]
+
+        return [
+            (int(round(x_ratio * width_scale)), int(round(y_ratio * height_scale)))
+            for y_ratio in y_positions
+            for x_ratio in x_positions
+        ]
+
+    def add_regression_sample(
+        self,
+        target_screen_point: tuple[int, int],
+        raw_yaw_deg: float,
+        raw_pitch_deg: float,
+    ) -> int:
+        target_point = self._clamp_screen_point(target_screen_point)
+        target_samples = self.regression_samples.setdefault(target_point, [])
+        target_samples.append((float(raw_yaw_deg), float(raw_pitch_deg)))
+        self.regression_coefficients_x = None
+        self.regression_coefficients_y = None
+        self.regression_fit_error_px = None
+        return len(target_samples)
+
+    def add_calibration_sample(
+        self,
+        target_screen_point: tuple[int, int],
+        result: GazeTrackingResult,
+    ) -> int:
+        if result.raw_yaw_deg is None or result.raw_pitch_deg is None:
+            raise ValueError("A valid tracking result is required before adding a calibration sample.")
+        if not result.face_detected or not result.eyes_calibrated:
+            raise ValueError("Face and eye calibration must be valid before adding a calibration sample.")
+
+        return self.add_regression_sample(target_screen_point, result.raw_yaw_deg, result.raw_pitch_deg)
+
+    def fit_regression_calibration(self, minimum_targets: int = 9) -> float:
+        if self.regression_target_count < minimum_targets:
+            raise ValueError(
+                f"Regression calibration requires at least {minimum_targets} unique targets, got {self.regression_target_count}."
+            )
+
+        design_rows = []
+        target_x_values = []
+        target_y_values = []
+        width_scale = max(self.screen_width - 1, 1)
+        height_scale = max(self.screen_height - 1, 1)
+
+        for target_point in sorted(self.regression_samples):
+            target_samples = self.regression_samples[target_point]
+            if not target_samples:
+                continue
+
+            sample_array = np.asarray(target_samples, dtype=float)
+            median_yaw_deg, median_pitch_deg = np.median(sample_array, axis=0)
+            design_rows.append(_quadratic_features(median_yaw_deg, median_pitch_deg))
+            target_x_values.append(target_point[0] / width_scale)
+            target_y_values.append(target_point[1] / height_scale)
+
+        if len(design_rows) < minimum_targets:
+            raise ValueError(
+                f"Regression calibration requires at least {minimum_targets} populated targets, got {len(design_rows)}."
+            )
+
+        design_matrix = np.vstack(design_rows)
+        target_x = np.asarray(target_x_values, dtype=float)
+        target_y = np.asarray(target_y_values, dtype=float)
+
+        self.regression_coefficients_x = np.linalg.lstsq(design_matrix, target_x, rcond=None)[0]
+        self.regression_coefficients_y = np.linalg.lstsq(design_matrix, target_y, rcond=None)[0]
+
+        predicted_x = design_matrix @ self.regression_coefficients_x
+        predicted_y = design_matrix @ self.regression_coefficients_y
+        error_x_px = (predicted_x - target_x) * width_scale
+        error_y_px = (predicted_y - target_y) * height_scale
+        self.regression_fit_error_px = float(np.sqrt(np.mean(error_x_px * error_x_px + error_y_px * error_y_px)))
+        return self.regression_fit_error_px
 
     def process_frame(
         self,
@@ -132,11 +257,12 @@ class StreamGazePointTracker:
 
         frame_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         results = self.face_mesh.process(frame_rgb)
+        mapping_calibrated = self.center_calibrated or self.regression_calibrated
         if not results.multi_face_landmarks:
             return GazeTrackingResult(
                 face_detected=False,
                 eyes_calibrated=self._eyes_calibrated,
-                center_calibrated=self.center_calibrated,
+            center_calibrated=mapping_calibrated,
                 screen_point=None,
                 normalized_point=None,
                 raw_yaw_deg=None,
@@ -144,6 +270,10 @@ class StreamGazePointTracker:
                 gaze_vector=None,
                 frame_size=(frame_width, frame_height),
                 message="No face detected.",
+                regression_calibrated=self.regression_calibrated,
+                calibration_samples=self.regression_sample_count,
+                calibration_targets=self.regression_target_count,
+                regression_fit_error_px=self.regression_fit_error_px,
             )
 
         face_landmarks = results.multi_face_landmarks[0].landmark
@@ -161,7 +291,7 @@ class StreamGazePointTracker:
             return GazeTrackingResult(
                 face_detected=True,
                 eyes_calibrated=False,
-                center_calibrated=self.center_calibrated,
+                center_calibrated=mapping_calibrated,
                 screen_point=None,
                 normalized_point=None,
                 raw_yaw_deg=None,
@@ -169,6 +299,10 @@ class StreamGazePointTracker:
                 gaze_vector=None,
                 frame_size=(frame_width, frame_height),
                 message="Face detected. Call process_frame(..., calibrate_eyes=True) once while the user looks at screen center.",
+                regression_calibrated=self.regression_calibrated,
+                calibration_samples=self.regression_sample_count,
+                calibration_targets=self.regression_target_count,
+                regression_fit_error_px=self.regression_fit_error_px,
             )
 
         sphere_world_l, sphere_world_r = self._compute_eye_spheres(head_center, rotation_matrix, nose_points_3d)
@@ -185,18 +319,32 @@ class StreamGazePointTracker:
             self.calibration_offset_pitch = -raw_pitch_deg
             self.center_calibrated = True
 
-        screen_x, screen_y = self._screen_coordinates(raw_yaw_deg, raw_pitch_deg)
-        normalized_x = screen_x / max(self.screen_width, 1)
-        normalized_y = screen_y / max(self.screen_height, 1)
+        if self.regression_calibrated:
+            screen_x, screen_y = self._regression_screen_coordinates(raw_yaw_deg, raw_pitch_deg)
+        else:
+            screen_x, screen_y = self._screen_coordinates(raw_yaw_deg, raw_pitch_deg)
+        normalized_x = screen_x / max(self.screen_width - 1, 1)
+        normalized_y = screen_y / max(self.screen_height - 1, 1)
 
-        message = "Tracking."
-        if not self.center_calibrated:
-            message = "Eyes calibrated. Call process_frame(..., calibrate_center=True) once while the user looks at screen center."
+        message = "Tracking with 9-point regression calibration."
+        if not self.regression_calibrated:
+            if self.regression_target_count > 0:
+                message = (
+                    f"Collected regression samples for {self.regression_target_count} targets and "
+                    f"{self.regression_sample_count} total samples. Fit regression after collecting all 9 points."
+                )
+            elif not self.center_calibrated:
+                message = (
+                    "Eyes calibrated. Call process_frame(..., calibrate_center=True) once while the user looks at "
+                    "screen center, or collect 9-point regression samples."
+                )
+            else:
+                message = "Tracking with linear center calibration."
 
         return GazeTrackingResult(
             face_detected=True,
             eyes_calibrated=True,
-            center_calibrated=self.center_calibrated,
+            center_calibrated=mapping_calibrated,
             screen_point=(screen_x, screen_y),
             normalized_point=(normalized_x, normalized_y),
             raw_yaw_deg=raw_yaw_deg,
@@ -204,6 +352,10 @@ class StreamGazePointTracker:
             gaze_vector=combined_direction,
             frame_size=(frame_width, frame_height),
             message=message,
+            regression_calibrated=self.regression_calibrated,
+            calibration_samples=self.regression_sample_count,
+            calibration_targets=self.regression_target_count,
+            regression_fit_error_px=self.regression_fit_error_px,
         )
 
     @property
@@ -298,6 +450,7 @@ class StreamGazePointTracker:
         self.calibration_offset_yaw = 0.0
         self.calibration_offset_pitch = 0.0
         self.center_calibrated = False
+        self.reset_regression_calibration()
 
     def _compute_eye_spheres(
         self,
@@ -348,6 +501,29 @@ class StreamGazePointTracker:
         screen_x = max(0, min(screen_x, self.screen_width - 1))
         screen_y = max(0, min(screen_y, self.screen_height - 1))
         return screen_x, screen_y
+
+    def _regression_screen_coordinates(self, raw_yaw_deg: float, raw_pitch_deg: float) -> tuple[int, int]:
+        if not self.regression_calibrated:
+            return self._screen_coordinates(raw_yaw_deg, raw_pitch_deg)
+
+        feature_vector = _quadratic_features(raw_yaw_deg, raw_pitch_deg)
+        normalized_x = float(feature_vector @ self.regression_coefficients_x)
+        normalized_y = float(feature_vector @ self.regression_coefficients_y)
+        normalized_x = max(0.0, min(normalized_x, 1.0))
+        normalized_y = max(0.0, min(normalized_y, 1.0))
+
+        width_scale = max(self.screen_width - 1, 1)
+        height_scale = max(self.screen_height - 1, 1)
+        screen_x = int(round(normalized_x * width_scale))
+        screen_y = int(round(normalized_y * height_scale))
+        return screen_x, screen_y
+
+    def _clamp_screen_point(self, target_screen_point: tuple[int, int]) -> tuple[int, int]:
+        target_x = int(round(target_screen_point[0]))
+        target_y = int(round(target_screen_point[1]))
+        target_x = max(0, min(target_x, self.screen_width - 1))
+        target_y = max(0, min(target_y, self.screen_height - 1))
+        return target_x, target_y
 
 
 if __name__ == "__main__":

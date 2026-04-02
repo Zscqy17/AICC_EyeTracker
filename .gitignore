@@ -5,3 +5,4 @@
 **/.venv312/
 **/__pycache__/
 Webcam3DTracker/screen_position.txt
+Webcam3DTracker/monitor_tracking_regression.npz
